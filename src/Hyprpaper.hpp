@@ -8,6 +8,7 @@
 #include "helpers/PoolBuffer.hpp"
 #include "ipc/Socket.hpp"
 #include "render/WallpaperTarget.hpp"
+#include "state/GardenState.hpp"
 #include <mutex>
 
 struct SWallpaperRenderData {
@@ -23,6 +24,7 @@ public:
     zwlr_layer_shell_v1* m_sLayerShell = nullptr;                 // expected
     wp_fractional_scale_manager_v1* m_sFractionalScale = nullptr; // will remain null if not bound
     wp_viewporter* m_sViewporter = nullptr;                       // expected
+    SGardenState* m_sGardenState = nullptr;
 
     // init the utility
     CHyprpaper();

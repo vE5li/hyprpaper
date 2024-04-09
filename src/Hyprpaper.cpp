@@ -3,6 +3,7 @@
 #include <fstream>
 #include <signal.h>
 #include <sys/types.h>
+#include <thread>
 
 CHyprpaper::CHyprpaper() = default;
 
@@ -16,6 +17,8 @@ void CHyprpaper::init() {
     removeOldHyprpaperImages();
 
     m_sDisplay = (wl_display*)wl_display_connect(nullptr);
+
+    m_sGardenState = new SGardenState();
 
     if (!m_sDisplay) {
         Debug::log(CRIT, "No wayland compositor running!");
@@ -41,6 +44,17 @@ void CHyprpaper::init() {
 
     if (std::any_cast<Hyprlang::INT>(g_pConfigManager->config->getConfigValue("ipc")))
         g_pIPCSocket->initialize();
+
+    std::thread([&]() {
+        while (1) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+
+            std::lock_guard<std::mutex> lg(m_mtTickMutex);
+            m_sGardenState->update();
+            tick(true);
+            wl_display_flush(m_sDisplay);
+        }
+    }).detach();
 
     do {
         std::lock_guard<std::mutex> lg(m_mtTickMutex);
@@ -177,8 +191,9 @@ void CHyprpaper::recheckMonitor(SMonitor* pMonitor) {
         }
     }
 
-    if (pMonitor->wantsReload) {
+    if (pMonitor->wantsReload || m_sGardenState->needsReload) {
         pMonitor->wantsReload = false;
+        m_sGardenState->needsReload = false;
         renderWallpaperForMonitor(pMonitor);
     }
 }
@@ -292,6 +307,7 @@ void CHyprpaper::clearWallpaperFromMonitor(const std::string& monname) {
     }
 }
 
+// TODO: This will need to be removed.
 void CHyprpaper::ensureMonitorHasActiveWallpaper(SMonitor* pMonitor) {
     if (!pMonitor->readyForLS || !pMonitor->hasATarget)
         return;
@@ -494,91 +510,33 @@ void CHyprpaper::renderWallpaperForMonitor(SMonitor* pMonitor) {
     cairo_paint(PCAIRO);
     cairo_restore(PCAIRO);
 
+    int offset = m_sGardenState->m_leftOffset;
+    Debug::log(LOG, "Rendering at offset %i", offset);
+
     // always draw a black background behind the wallpaper
-    cairo_set_source_rgb(PCAIRO, 0, 0, 0);
+    cairo_set_source_rgb(PCAIRO, 0.3, 0, 0);
     cairo_rectangle(PCAIRO, 0, 0, DIMENSIONS.x, DIMENSIONS.y);
     cairo_fill(PCAIRO);
+
+    cairo_set_source_rgb(PCAIRO, 1.0, 1.0, 0);
+    cairo_rectangle(PCAIRO, offset, offset, offset + 500, offset + 500);
+    cairo_fill(PCAIRO);
+
     cairo_surface_flush(PBUFFER->surface);
-
-    // get scale
-    // we always do cover
-    double scale;
-    Vector2D origin;
-
-    const bool LOWASPECTRATIO = pMonitor->size.x / pMonitor->size.y > PWALLPAPERTARGET->m_vSize.x / PWALLPAPERTARGET->m_vSize.y;
-    if ((CONTAIN && !LOWASPECTRATIO) || (!CONTAIN && LOWASPECTRATIO)) {
-        scale = DIMENSIONS.x / PWALLPAPERTARGET->m_vSize.x;
-        origin.y = -(PWALLPAPERTARGET->m_vSize.y * scale - DIMENSIONS.y) / 2.0 / scale;
-    } else {
-        scale = DIMENSIONS.y / PWALLPAPERTARGET->m_vSize.y;
-        origin.x = -(PWALLPAPERTARGET->m_vSize.x * scale - DIMENSIONS.x) / 2.0 / scale;
-    }
-
-    Debug::log(LOG, "Image data for %s: %s at [%.2f, %.2f], scale: %.2f (original image size: [%i, %i])", pMonitor->name.c_str(), PWALLPAPERTARGET->m_szPath.c_str(), origin.x, origin.y, scale, (int)PWALLPAPERTARGET->m_vSize.x, (int)PWALLPAPERTARGET->m_vSize.y);
-
-    cairo_scale(PCAIRO, scale, scale);
-    cairo_set_source_surface(PCAIRO, PWALLPAPERTARGET->m_pCairoSurface, origin.x, origin.y);
-
-    cairo_paint(PCAIRO);
-
-    if (**PRENDERSPLASH && getenv("HYPRLAND_INSTANCE_SIGNATURE")) {
-        auto SPLASH = execAndGet("hyprctl splash");
-        SPLASH.pop_back();
-
-        Debug::log(LOG, "Rendering splash: %s", SPLASH.c_str());
-
-        cairo_select_font_face(PCAIRO, "Sans", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
-
-        const auto FONTSIZE = (int)(DIMENSIONS.y / 76.0 / scale);
-        cairo_set_font_size(PCAIRO, FONTSIZE);
-
-        static auto* const PSPLASHCOLOR = reinterpret_cast<Hyprlang::INT* const*>(g_pConfigManager->config->getConfigValuePtr("splash_color")->getDataStaticPtr());
-        
-        Debug::log(LOG, "Splash color: %x", **PSPLASHCOLOR);
-
-        cairo_set_source_rgba(PCAIRO, ((**PSPLASHCOLOR >> 16) & 0xFF) / 255.0, ((**PSPLASHCOLOR >> 8) & 0xFF) / 255.0, (**PSPLASHCOLOR & 0xFF) / 255.0, ((**PSPLASHCOLOR >> 24) & 0xFF) / 255.0);
-
-        cairo_text_extents_t textExtents;
-        cairo_text_extents(PCAIRO, SPLASH.c_str(), &textExtents);
-
-        cairo_move_to(PCAIRO, ((DIMENSIONS.x - textExtents.width * scale) / 2.0) / scale, ((DIMENSIONS.y * (100 - **PSPLASHOFFSET)) / 100 - textExtents.height * scale) / scale);
-
-        Debug::log(LOG, "Splash font size: %d, pos: %.2f, %.2f", FONTSIZE, (DIMENSIONS.x - textExtents.width) / 2.0 / scale, ((DIMENSIONS.y * (100 - **PSPLASHOFFSET)) / 100 - textExtents.height * scale) / scale);
-
-        cairo_show_text(PCAIRO, SPLASH.c_str());
-
-        cairo_surface_flush(PWALLPAPERTARGET->m_pCairoSurface);
-    }
-
-    cairo_restore(PCAIRO);
 
     if (pMonitor->pCurrentLayerSurface) {
         wl_surface_attach(pMonitor->pCurrentLayerSurface->pSurface, PBUFFER->buffer, 0, 0);
-        wl_surface_set_buffer_scale(pMonitor->pCurrentLayerSurface->pSurface, pMonitor->pCurrentLayerSurface->pFractionalScaleInfo ? 1 : pMonitor->scale);
+        wl_surface_set_buffer_scale(pMonitor->pCurrentLayerSurface->pSurface, 1);
         wl_surface_damage_buffer(pMonitor->pCurrentLayerSurface->pSurface, 0, 0, 0xFFFF, 0xFFFF);
 
-        // our wps are always opaque
+        // Make the entire surface opaque. This is most likely for Wayland internal optimization.
         auto opaqueRegion = wl_compositor_create_region(g_pHyprpaper->m_sCompositor);
         wl_region_add(opaqueRegion, 0, 0, PBUFFER->pixelSize.x, PBUFFER->pixelSize.y);
         wl_surface_set_opaque_region(pMonitor->pCurrentLayerSurface->pSurface, opaqueRegion);
 
-        if (pMonitor->pCurrentLayerSurface->pFractionalScaleInfo) {
-            Debug::log(LOG, "Submitting viewport dest size %ix%i for %x", static_cast<int>(std::round(pMonitor->size.x)), static_cast<int>(std::round(pMonitor->size.y)), pMonitor->pCurrentLayerSurface);
-            wp_viewport_set_destination(pMonitor->pCurrentLayerSurface->pViewport, static_cast<int>(std::round(pMonitor->size.x)), static_cast<int>(std::round(pMonitor->size.y)));
-        }
         wl_surface_commit(pMonitor->pCurrentLayerSurface->pSurface);
 
         wl_region_destroy(opaqueRegion);
-    }
-
-    // check if we dont need to remove a wallpaper
-    if (pMonitor->layerSurfaces.size() > 1) {
-        for (auto it = pMonitor->layerSurfaces.begin(); it != pMonitor->layerSurfaces.end(); it++) {
-            if (pMonitor->pCurrentLayerSurface != it->get()) {
-                pMonitor->layerSurfaces.erase(it);
-                break;
-            }
-        }
     }
 }
 
